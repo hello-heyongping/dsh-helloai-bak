@@ -1,0 +1,4 @@
+# dsh-helloai-bak bundle patch
+- insert:
+    - id: helloai-backup
+      name: "@hello-heyongping/dsh-helloai-bak"

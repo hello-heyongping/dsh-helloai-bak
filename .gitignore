@@ -1,0 +1,8 @@
+# dsh-helloai-bak ignores
+#
+# NOTE: lib/ is deliberately NOT ignored. The repository ships the built
+# artifacts so that `dsh plugin --profile <p> add github:hello-heyongping/dsh-helloai-bak`
+# works without a build step. `npm run build` regenerates lib/ from src/.
+node_modules/
+*.tgz
+.dsh-helloai-bak-build-*/

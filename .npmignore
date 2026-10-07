@@ -1,0 +1,5 @@
+# dsh-helloai-bak ignores
+node_modules/
+lib/
+*.tgz
+.dsh-helloai-bak-build-*/
