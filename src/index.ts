@@ -140,7 +140,7 @@ async function listProfiles(root: string): Promise<ProfileContext[]> {
 }
 
 /** Reads every dependency declaration that points at a path outside the profile. */
-function declaredLinks(profile: ProfileContext): PluginLink[] {
+async function declaredLinks(profile: ProfileContext): Promise<PluginLink[]> {
   const links: PluginLink[] = [];
   for (const section of DEPENDENCY_SECTIONS) {
     const deps = profile.packageJson?.[section];
@@ -148,7 +148,19 @@ function declaredLinks(profile: ProfileContext): PluginLink[] {
     for (const [linkName, spec] of Object.entries(deps)) {
       const path = pathFromLocalSpec(profile.root, spec);
       if (!path) continue;
-      links.push({ profile: profile.name, linkName, path, target: String(spec), kind: "directory", origin: "declared", declared: true, section, spec: String(spec), exists: true });
+      // Classify by the TARGET, never by the dependency section: a `file:` spec may
+      // point at a packed tarball (.tgz), which has no package.json of its own.
+      // Recording that as "directory" made discoverPlugins mark the plugin
+      // "directory", so packagePluginPayload read the tarball through
+      // collectDirectoryWithStats(): the file's relative name came out empty and was
+      // prefixed into `external/NNN-<slug>/` — a trailing-slash (directory) entry
+      // holding the tarball bytes. Restore recreated an empty directory from that
+      // entry and the tarball was silently lost. linkedPlugins/bundleLinks already
+      // classify by the target for the same reason (on Windows a junction reports
+      // as a symlink, so lstat() cannot answer this).
+      const targetInfo = await stat(path).catch(() => undefined);
+      const kind: "directory" | "file" = targetInfo && !targetInfo.isDirectory() ? "file" : "directory";
+      links.push({ profile: profile.name, linkName, path, target: String(spec), kind, origin: "declared", declared: true, section, spec: String(spec), exists: true });
     }
   }
   return links;
@@ -223,7 +235,7 @@ async function bundleLinks(profile: ProfileContext): Promise<PluginLink[]> {
 async function discoverPlugins(root: string): Promise<LocalPlugin[]> {
   const profiles = await listProfiles(root);
   const all: PluginLink[] = [];
-  for (const profile of profiles) all.push(...declaredLinks(profile), ...await linkedPlugins(profile), ...await bundleLinks(profile));
+  for (const profile of profiles) all.push(...await declaredLinks(profile), ...await linkedPlugins(profile), ...await bundleLinks(profile));
 
   const grouped = new Map<string, { source: string; links: PluginLink[] }>();
   const insideHome = new Map<string, { source: string; links: PluginLink[] }>();
@@ -842,11 +854,11 @@ async function reinstallProfiles(root: string) {
   return { installed, warnings };
 }
 
-async function replaceLocalLink(linkPath: string, target: string, kind: "directory" | "file") {
+async function replaceLocalLink(linkPath: string, target: string) {
   await mkdir(dirname(linkPath), { recursive: true });
   await rm(linkPath, { recursive: true, force: true });
   try {
-    await symlink(target, linkPath, kind === "directory" ? "junction" : "file");
+    await symlink(target, linkPath, "junction");
   } catch (error) {
     // A normal symlink is a useful fallback on systems where junctions are
     // unavailable. Do not silently leave the stale package directory behind.
@@ -873,7 +885,7 @@ async function ensureProfileLinks(root: string, plugins: readonly LocalPlugin[],
   const profileNames = new Set<string>();
   for (const profile of await listProfiles(root)) {
     profileNames.add(profile.name);
-    for (const link of declaredLinks(profile)) {
+    for (const link of await declaredLinks(profile)) {
       const target = link.linkName === SELF_PACKAGE ? currentPluginRoot() : targetOf(link.path);
       request.set(`${profile.name}|${link.linkName}`, { profile: profile.name, packageName: link.linkName, target });
     }
@@ -891,8 +903,18 @@ async function ensureProfileLinks(root: string, plugins: readonly LocalPlugin[],
     const profileRoot = join(root, "profiles", item.profile);
     const info = await lstat(item.target).catch(() => undefined);
     if (!info) { warnings.push(`${item.profile}/${item.packageName}: 找不到本地插件目录 ${item.target}`); continue; }
+    const linkPath = dependencyLinkPath(profileRoot, item.packageName);
+    // A packed tarball is not a directory to link to: the profile declares it as a
+    // `file:` dependency and the package manager installs it (reinstallProfiles
+    // runs before this). Replacing that install with a symlink to the .tgz left
+    // node_modules/<name> pointing at gzip bytes — `require('@scope/pkg')` then died
+    // with "Invalid or unexpected token" while the restore still reported success.
+    if (!info.isDirectory()) {
+      if (!await exists(join(linkPath, "package.json"))) warnings.push(`${item.profile}/${item.packageName}: 本地插件包已恢复到 ${item.target}，但尚未安装到 profile；请在该 profile 运行包管理器安装`);
+      continue;
+    }
     try {
-      await replaceLocalLink(dependencyLinkPath(profileRoot, item.packageName), item.target, info.isDirectory() ? "directory" : "file");
+      await replaceLocalLink(linkPath, item.target);
       linked.push(`${item.profile}/${item.packageName}`);
     } catch (error) { warnings.push(`${item.profile}/${item.packageName}: 无法重新建立链接：${String(error)}`); }
   }
@@ -915,9 +937,15 @@ async function validateRestore(root: string, plugins: readonly LocalPlugin[], ma
     const links: RestorePluginReport["links"] = [];
     for (const link of plugin.links) {
       const linkPath = dependencyLinkPath(join(root, "profiles", link.profile), link.linkName);
-      const linkTarget = await realpath(linkPath).catch(() => undefined);
-      const ok = Boolean(linkTarget && actualPath && normalizedPath(linkTarget) === normalizedPath(actualPath));
-      links.push({ profile: link.profile, linkName: link.linkName, linkPath, ok, message: ok ? undefined : `链接未指向插件目录（${linkPath}）` });
+      // A file-kind plugin is a package archive, never a link target: what matters
+      // is that the profile has it installed, not that the link resolves back to
+      // the tarball (that is exactly what made Node parse gzip as JavaScript).
+      const linkTarget = plugin.kind === "file" ? undefined : await realpath(linkPath).catch(() => undefined);
+      const installed = plugin.kind === "file" ? await readJsonFile(join(linkPath, "package.json")) : undefined;
+      const ok = plugin.kind === "file"
+        ? Boolean(installed)
+        : Boolean(linkTarget && actualPath && normalizedPath(linkTarget) === normalizedPath(actualPath));
+      links.push({ profile: link.profile, linkName: link.linkName, linkPath, ok, message: ok ? undefined : (plugin.kind === "file" ? `插件包未安装到 profile（${linkPath}）` : `链接未指向插件目录（${linkPath}）`) });
     }
     const failedLinks = links.filter((link) => !link.ok);
     let status: RestorePluginReport["status"];

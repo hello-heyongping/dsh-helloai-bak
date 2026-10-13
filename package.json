@@ -38,7 +38,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && npm run build && node test-archive.mjs && node test-portable.mjs && node test-restore-safety.mjs && node test-plugins.mjs && node test-route-lifecycle.mjs && node test-client.mjs",
+    "test": "npm run typecheck && npm run build && node test-archive.mjs && node test-portable.mjs && node test-restore-safety.mjs && node test-plugins.mjs && node test-file-plugin.mjs && node test-route-lifecycle.mjs && node test-client.mjs",
     "pack:check": "npm pack --dry-run --json",
     "prepack": "npm run typecheck && npm run build"
   },
